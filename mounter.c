@@ -809,15 +809,11 @@ static UBYTE ToUpper(UBYTE c)
 	}
 	return c;
 }
-
-// Case-insensitive BSTR string comparison
-static BOOL CompareBSTRNoCase(const UBYTE *src1, const UBYTE *src2)
-{
-	UBYTE len1 = *src1++;
-	UBYTE len2 = *src2++;
+static BOOL CompareSTRNoCase(const UBYTE *src1, ULONG len1, const UBYTE *src2, ULONG len2) {
 	if (len1 != len2) {
 		return FALSE;
 	}
+
 	for (UWORD i = 0; i < len1; i++) {
 		UBYTE c1 = *src1++;
 		UBYTE c2 = *src2++;
@@ -828,6 +824,14 @@ static BOOL CompareBSTRNoCase(const UBYTE *src1, const UBYTE *src2)
 		}
 	}
 	return TRUE;
+}
+
+// Case-insensitive BSTR string comparison
+static BOOL CompareBSTRNoCase(const UBYTE *src1, const UBYTE *src2)
+{
+	ULONG len1 = *src1++;
+	ULONG len2 = *src2++;
+	return CompareSTRNoCase(src1,len1,src2,len2);
 }
 
 // Check for duplicate device names
@@ -1150,42 +1154,84 @@ static bool isDataCD(struct IOStdReq *ior)
 	return ret;
 }
 
-// CheckPVD
-// Check for "CDTV" or "AMIGA BOOT" as the System ID in the PVD
-// Returns: -1 on error, 0 if not CDTV/AMIGA BOOT, 1 if bootable
-static LONG CheckPVD(struct IOStdReq *ior, struct ExecBase *SysBase)
-{
-	const char sys_id_1[] = "CDTV";
-	const char sys_id_2[] = "AMIGA BOOT";
-	const char iso_id[]   = "CD001";
+// Find a file or directory matching *name
+ULONG iso_scan_directory(ULONG lba, char *buf, char *name, ULONG length, struct MountData *md) {
+	iso_dir_t *dir = (iso_dir_t *)buf;
+	iso_dir_t *cur;
+	ULONG offset;
+	ULONG remaining;
 
-	BYTE err = 0;
-	LONG ret = -1;
-	char *buf = NULL;
+	readblock(buf,lba,-1,md);
+	remaining = dir->data_length.be;
 
-	if (!(buf = AllocMem(2048,MEMF_ANY|MEMF_CLEAR))) goto done;
+	while (remaining > 0) {
+		offset = 0;
+		while (offset < 2048) {
+			cur = (iso_dir_t *)(buf + offset);
+			if (cur->length == 0) {
+				break;              // rest of sector is padding
+			}
 
-	char *id_string = buf + 1;
-	char *system_id = buf + 8;
+			char *fname = &cur->filename;
+			UBYTE namelen = cur->filename_len;
+			if ((cur->flags & 0x01) == 0) {
+				// Strip ISO9660 ";version" suffix (files only)
+				for (int i = 0; i < namelen; i++) {
+					if (fname[i] == ';') {
+						namelen = i;
+						break;
+					}
+				}
+			}
+			if (CompareSTRNoCase(name,length,fname,namelen)) {
+				return cur->extent_lba.be;
+			}
 
-	ior->io_Command = CMD_READ;
-	ior->io_Data    = buf;
-	ior->io_Length  = 2048;
-	ior->io_Offset  = 32768; // Sector 16
-
-	for (int retry = 0; retry < 3; retry++) {
-		if ((err = DoIO((struct IORequest*)ior)) == 0) break;
+			offset += cur->length;
+		}
+		lba++;
+		remaining -= 2048;
+		if (remaining > 0) {
+			readblock(buf,lba,-1,md);
+		}
 	}
 
-	if (err == 0) {
+	return 0;
+}
+
+// isCDBootable
+// Check for "s/startup-sequence" existence indicating a bootable CD
+static bool isCDBootable(struct IOStdReq *ior, struct ExecBase *SysBase, struct MountData *md)
+{
+	UBYTE *buf;
+	LONG ret = -1;
+	iso_pvd_t *pvd = NULL;
+
+	char dir_s[]  = "S";
+	char file_ss[] = "STARTUP-SEQUENCE";
+	const char iso_id[]   = "CD001";
+	
+	if (!(pvd = AllocMem(2048,MEMF_ANY|MEMF_CLEAR))) goto done;
+
+	char *id_string = pvd->identifier;
+
+	if (readblock((UBYTE *)pvd,16,-1,md)) {
 		// Check ISO ID String & for PVD Version & Type code
-		if ((strncmp(iso_id,id_string,5) == 0) && buf[0] == 1 && buf[6] == 1) {
-			ret = (strncmp(sys_id_1,system_id,strlen(sys_id_1)) == 0 || strncmp(sys_id_2,system_id,strlen(sys_id_2)) == 0);
+		if ((strncmp(iso_id,id_string,5) == 0) && pvd->code == 1 && pvd->version == 1) {
+
+			if ((buf = AllocMem(2048,MEMF_CLEAR|MEMF_ANY))) {
+				ULONG s_lba = iso_scan_directory(pvd->root_dir.extent_lba.be,(char *)buf, dir_s, strlen(dir_s), md);
+				if (s_lba) {
+					ULONG ss_lba = iso_scan_directory(s_lba, (char *)buf,file_ss, strlen(file_ss), md);
+					if (ss_lba) ret = 0;
+				}
+				FreeMem(buf, 2048);
+			}
 		}
 	}
 
 done:
-	if (buf)  FreeMem(buf,2048);
+	if (pvd)  FreeMem(pvd,2048);
 	return ret;
 }
 
@@ -1206,18 +1252,15 @@ static LONG ScanCDROM(struct MountData *md)
 		return -1;
 
 	// "CDTV" or "AMIGA BOOT"?
-	isBootable = CheckPVD((struct IOStdReq *)md->request,SysBase);
+	isBootable = isCDBootable((struct IOStdReq *)md->request,SysBase,md);
 
 	if (isBootable == -1) {
 		// ISO PVD Not found, RDB CD?
 		return ScanRDSK(md);
-	} else {
-		if (isBootable) {
-			bootPri = 2; // Yes, give priority
-		} else {
-			bootPri = -1; // May not be a boot disk, lower priority than HDD
-		}
 	}
+
+	bootPri = 2;
+	
 
 	fse=find_filesystem(0x43443031, 0x43445644, md->SysBase);
 	if (!fse) {
